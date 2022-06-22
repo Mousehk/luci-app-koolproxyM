@@ -1,0 +1,239 @@
+#!/bin/sh
+# set -x
+
+. /lib/functions.sh
+
+CONFIG=koolproxy
+KP_DIR=/usr/share/koolproxy
+TMP_DIR=/tmp/koolproxy
+LOGFILE="/var/log/koolproxy.log"
+
+config_t_get() {
+	local index=0
+	[ -n "$4" ] && index=$4
+	local ret=$(uci get $CONFIG.@$1[$index].$2 2>/dev/null)
+	echo ${ret:=$3}
+}
+
+limit_log() {
+	local log=$1
+	[ ! -f "$log" ] && return
+	local sc=100
+	[ -n "$2" ] && sc=$2
+	local count=$(grep -c "" $log)
+	if [ $count -gt $sc ];then
+		let count=count-$sc
+		sed -i "1,$count d" $log
+	fi
+}
+
+init_env() {
+	rm -rf "$TMP_DIR"
+	mkdir -p "$TMP_DIR"
+}
+
+restart_koolproxy() {
+	/etc/init.d/koolproxy restart
+}
+
+__compare_file() {
+	local descript=$1
+	local localPath=$2
+	local remoteUrl=$3
+
+	echo $(date "+%F %T"): ------------------- $descript更新 ------------------- >>$LOGFILE
+	local filename=`basename $localPath`
+	local remotePath="$TMP_DIR/$filename"
+	wget-ssl -qT5 --no-check-certificate "$remoteUrl" -O "$remotePath"
+	if [ "$?" == "0" ]; then
+		if [ -f "$localPath" ]; then
+			localMD5=`md5sum "$localPath" | awk '{print $1}'`
+			localNum=`cat "$localPath" | grep -v '^!' | wc -l`
+		else
+			localMD5="文件不存在"
+			localNum="0"
+		fi
+		remoteMD5=`md5sum "$remotePath" | awk '{print $1}'`
+		remoteNum=`cat "$remotePath" | grep -v '^!' | wc -l`
+
+		echo $(date "+%F %T"): 本地版本MD5：$localMD5 >>$LOGFILE
+		echo $(date "+%F %T"): 本地版本条数：$localNum >>$LOGFILE
+		echo >>$LOGFILE
+		echo $(date "+%F %T"): 在线版本MD5：$remoteMD5 >>$LOGFILE
+		echo $(date "+%F %T"): 在线版本条数：$remoteNum >>$LOGFILE
+		echo >>$LOGFILE
+
+		if [ "$localMD5" != "$remoteMD5" ];then
+			echo $(date "+%F %T"): 检测到更新，开始更新规则！ >>$LOGFILE
+			mv -f "$remotePath" "$localPath"
+			echo $(date "+%F %T"): 更新成功！ >>$LOGFILE
+			echo >>$LOGFILE
+			return 0
+		fi
+	else
+		echo "$(date "+%F %T"): 获取在线版本时出现错误! " >>$LOGFILE
+		echo >>$LOGFILE
+	fi
+	return 1
+}
+
+__update_rule() {
+	local name
+	local file
+	local exrule
+	local enable
+	config_get name $1 name
+	config_get file $1 file
+	config_get exrule $1 url
+	config_get enable $1 load
+	if [ -n "$file" ] && [ -n "$exrule" ]; then
+		if [ $enable -ne 1 ]; then
+			return
+		fi
+		__compare_file "$name" "$KP_DIR/data/rules/$file" "$exrule"
+		if [ "$?" == "0" ]; then
+			uci set koolproxy.$1.time="`date +%Y-%m-%d" "%H:%M`"
+			uci commit koolproxy
+			RESTART_KOOLPROXY=true
+		fi
+		cat $KP_DIR/data/rules/$file >>$KP_DIR/data/rules/user.txt
+		echo >>$LOGFILE
+	fi
+}
+
+update_rss_rules() {
+	cp $KP_DIR/data/user.txt $KP_DIR/data/rules/user.txt
+	config_load $CONFIG
+	config_foreach __update_rule rss_rule
+}
+
+
+	
+update_rules() {
+	url_koolproxy="https://cdn.jsdelivr.net/gh/Mousehk/kpr-@master/koolproxy%2Bdaily.txt"
+	url_ad="https://gitee.com/halflife/list/raw/master/ad.txt"
+	url_anti_ad="https://cdn.jsdelivr.net/gh/privacy-protection-tools/anti-AD@master/anti-ad-easylist.txt"
+	url_kp="https://cdn.jsdelivr.net/gh/Mousehk/kpr-@master/kp.dat"
+	url_tvbox="https://shaoxia1991.coding.net/p/yhosts/d/yhosts/git/raw/master/data/tvbox.txt"
+	url_dykpr="https://cdn.jsdelivr.net/gh/Mousehk/kpr-@master/dykpr.txt"
+	echo $(date "+%F %T"): ------------------- 内置规则更新 ------------------- >>$LOGFILE
+	chmod -R 777 $KP_DIR/data/rules
+	mkdir -p /tmp/koolproxy
+	# koolproxy+daily每日规则
+	for i in {1..5}; do
+		wget $url_koolproxy -O /tmp/koolproxy/koolproxy.txt --no-check-certificate
+		if [[ "$?" -eq 0 ]] ; then
+			koolproxy_rule_local=`cat $KP_DIR/data/rules/koolproxy.txt | sed -n '3p'|awk '{print $3,$4}'`
+			koolproxy_rule_new=`cat /tmp/koolproxy/koolproxy.txt | sed -n '3p'|awk '{print $3,$4}'`
+			kp_rule_local=`cat $KP_DIR/data/rules/koolproxy.txt | sed -n '4p'|awk '{print $3,$4}'`
+			kp_rule_new=`cat /tmp/koolproxy/koolproxy.txt | sed -n '4p'|awk '{print $3,$4}'`
+			if [ "$koolproxy_rule_local" != "$koolproxy_rule_new" ] || [ "$kp_rule_local" != "$kp_rule_new" ]; then
+				mv /tmp/koolproxy/koolproxy.txt $KP_DIR/data/rules/koolproxy.txt
+				echo $(date "+%F %T"): -------------------koolproxy规则    Version：$koolproxy_rule_new >>$LOGFILE
+			fi
+			break
+		fi
+	done
+	# 乘风视频广告过滤、EasylistChina、EasylistLite、CJX'sAnnoyance规则
+	for i in {1..5}; do
+		wget $url_ad -O /tmp/koolproxy/ad.txt --no-check-certificate
+		if [[ "$?" -eq 0 ]] ; then
+			ad_rule_local=`cat $KP_DIR/data/rules/ad.txt | sed -n '5p'|awk '{print $3}'`
+			ad_rule_new=`cat /tmp/koolproxy/ad.txt | sed -n '5p'|awk '{print $3}'`
+			if [[ "$ad_rule_local" != "$ad_rule_new"  ]]; then
+				mv /tmp/koolproxy/ad.txt $KP_DIR/data/rules/ad.txt
+				echo $(date "+%F %T"): --------------ad规则合集     Version：$ad_rule_new >>$LOGFILE
+			fi
+			break
+		fi
+	done
+	# anti-ad规则
+	for i in {1..5}; do
+		wget $url_anti_ad -O /tmp/koolproxy/anti-ad.txt --no-check-certificate
+		if [[ "$?" -eq 0 ]] ; then
+			anti_ad_local=`cat $KP_DIR/data/rules/anti-ad.txt | sed -n '2p'|awk '{print $2}'`
+			anti_ad_new=`cat /tmp/koolproxy/anti-ad.txt | sed -n '2p'|awk '{print $2}'`
+			if [[ "$anti_ad_local" != "$anti_ad_new" ]]; then
+				mv /tmp/koolproxy/anti-ad.txt $KP_DIR/data/rules/anti-ad.txt
+				echo $(date "+%F %T"): -------------------anti-ad规则更新成功    Version：$anti_ad_new >>$LOGFILE
+			fi
+			break
+		fi
+	done
+	# kp.dat 规则
+	for i in {1..5}; do
+		wget $url_kp -O /tmp/koolproxy/kp.dat --no-check-certificate
+		if [[ "$?" -eq 0 ]] ; then
+			kp_video_md5=`md5sum $KP_DIR/data/rules/kp.dat | awk '{print $1}'`
+			kp_video_new_md5=`md5sum /tmp/koolproxy/kp.dat | awk '{print $1}'`
+			if [[ "$kp_video_md5" != "$kp_video_new_md5" ]]; then
+				mv /tmp/koolproxy/kp.dat $KP_DIR/data/rules/kp.dat
+				echo $(date "+%F %T"): -------------------kp视频规则更新成功 >>$LOGFILE
+			fi
+			break
+		fi
+	done
+	# tvbox盒子视频规则
+	for i in {1..5}; do
+		wget $url_tvbox -O /tmp/koolproxy/tvbox.txt --no-check-certificate
+		if [[ "$?" -eq 0 ]] ; then
+			sed -i 's/^127.0.0.1\ /||/g' /tmp/koolproxy/tvbox.txt
+			tvbox_video_md5=`md5sum $KP_DIR/data/rules/tvbox.txt | awk '{print $1}'`
+			tvbox_video_new_md5=`md5sum /tmp/koolproxy/tvbox.txt | awk '{print $1}'`
+			if [[ "$tvbox_video_md5" != "$tvbox_video_new_md5" ]]; then
+				mv /tmp/koolproxy/tvbox.txt $KP_DIR/data/rules/tvbox.txt
+				echo $(date "+%F %T"): -------------------tvbox盒子视频规则更新成功 >>$LOGFILE
+			fi
+			break
+		fi
+	done
+	# dykpr规则
+	for i in {1..5}; do
+		wget $url_dykpr -O /tmp/koolproxy/dykpr.txt --no-check-certificate
+		if [[ "$?" -eq 0 ]] ; then
+			dykpr_rule_local=`cat $KP_DIR/data/rules/dykpr.txt | sed -n '3p'|awk '{print $3,$4}'`
+			dykpr_rule_new=`cat /tmp/koolproxy/dykpr.txt | sed -n '3p'|awk '{print $3,$4}'`
+			dykpr_video_local=`cat $KP_DIR/data/rules/dykpr.txt | sed -n '4p'|awk '{print $3,$4}'`
+			dykpr_video_new=`cat /tmp/koolproxy/dykpr.txt | sed -n '4p'|awk '{print $3,$4}'`
+			if [ "$dykpr_rule_local" != "$dykpr_rule_new" ] || [ "$dykpr_rule_local" != "$dykpr_rule_new" ]; then
+				mv /tmp/koolproxy/dykpr.txt $KP_DIR/data/rules/dykpr.txt
+				echo $(date "+%F %T"): -------------------dykpr视频规则  RuleVersion：$dykpr_rule_new   VideoVersion：$dykpr_video_new >>$LOGFILE
+			fi
+			break
+		fi
+	done
+    echo $(date "+%F %T"): ------------------- 内置规则更新成功！ ------------------- >>$LOGFILE
+    RESTART_KOOLPROXY=true
+}
+
+update_adb_host() {
+	/usr/sbin/adblockplus >>$LOGFILE 2>&1 &
+	if [ "$?" == "0" ]; then
+		RESTART_DNSMASQ=true
+	fi
+}
+
+# main process
+init_env
+limit_log $LOGFILE
+
+# update rules
+update_rules
+
+# update user rules
+update_rss_rules
+
+koolproxy_mode=$(config_t_get global koolproxy_mode 1)
+koolproxy_host=$(config_t_get global koolproxy_host 0)
+
+# update ADB Plus Host
+if [ "$koolproxy_mode" == "2" ] && [ "$koolproxy_host" == "1" ];then
+	update_adb_host
+fi
+
+if [ $RESTART_KOOLPROXY ]; then
+	restart_koolproxy
+	echo $(date "+%F %T"): 重启KoolproxyM进程 >>$LOGFILE
+fi
+
+init_env
